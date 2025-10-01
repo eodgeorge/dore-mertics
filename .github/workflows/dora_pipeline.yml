@@ -1,1 +1,81 @@
+trigger: none
+# schedules:
+# - cron: "0 8 * * *"
+#   always: true
+#   branches: { include: [ main ] }
 
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+- group: dora-config
+
+stages:
+- stage: DORA
+  displayName: "DORA per application"
+  jobs:
+  - job: doraPerApp
+    displayName: "DORA per application"
+    strategy:
+      matrix:
+        emailQueue: { APP: "email-queue-api" }
+        enquiry:    { APP: "enquiry-api" }
+        enquirer:   { APP: "enquirer-api" }
+
+    steps:
+    - bash: |
+        COL="$(System.CollectionUri)"
+        ORG="${COL#https://dev.azure.com/}"; ORG="${ORG%/}"
+        echo "##vso[task.setvariable variable=ORG]$ORG"
+      displayName: "Derive org short name"
+
+    - task: UsePythonVersion@0
+      inputs: { versionSpec: '3.11' }
+      displayName: "Use Python 3.11"
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install requests
+      displayName: "Install deps"
+
+    - checkout: self
+
+    - bash: |
+        case "$(APP)" in
+          email-queue-api) DID="$(PIPELINE_ID_EMAIL_QUEUE)";;
+          enquiry-api)     DID="$(PIPELINE_ID_ENQUIRY)";;
+          enquirer-api)    DID="$(PIPELINE_ID_ENQUIRER)";;
+          *) echo "Unknown APP=$(APP)"; exit 1;;
+        esac
+        echo "Using DEF_ID=$DID for APP=$(APP)"
+        echo "##vso[task.setvariable variable=DEF_ID]$DID"
+      displayName: "Resolve DEF_ID from variable group"
+
+    - script: |
+        echo "Running DORA for $(APP) (defId=$(DEF_ID))"
+        python tools/dora_config.py \
+          --org $(ORG) \
+          --project $(System.TeamProject) \
+          --pipeline-ids "$(DEF_ID)" \
+          --branch "$(BRANCH)" \
+          --days $([ -n "$(DAYS)" ] && echo "$(DAYS)" || echo 90) \
+          $([ -n "$(GITHUB_TOKEN)" ] && echo --github-token "$(GITHUB_TOKEN)" || true) \
+          --github-repo "$(GITHUB_REPO)" \
+          --app "$(APP)" \
+          --out-prefix "$(APP)-" \
+          --verbose
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        GITHUB_TOKEN: $(GITHUB_TOKEN)
+      displayName: "Compute DORA ($(APP))"
+
+    - bash: |
+        mkdir -p "$(Build.ArtifactStagingDirectory)/dora-$(APP)"
+        mv *.csv "$(Build.ArtifactStagingDirectory)/dora-$(APP)/" || true
+      displayName: "Stage CSVs ($(APP))"
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/dora-$(APP)'
+        artifactName: 'dora-$(APP)'
+      displayName: "Publish DORA CSVs ($(APP))"
