@@ -1,81 +1,336 @@
-trigger: none
-# schedules:
-# - cron: "0 8 * * *"
-#   always: true
-#   branches: { include: [ main ] }
+name: DORA per application
 
-pool:
-  vmImage: ubuntu-latest
+on:
+  workflow_dispatch:
+  schedule:
+    # NOTE: GitHub schedules run on the repo's default branch only.
+    - cron: "0 8 * * *"
 
-variables:
-- group: dora-config
+permissions:
+  contents: read
+  deployments: write      # for the "Publish GitHub Deployment" step
+  pull-requests: read     # to read PR titles/bodies when mining Jira keys
 
-stages:
-- stage: DORA
-  displayName: "DORA per application"
-  jobs:
-  - job: doraPerApp
-    displayName: "DORA per application"
+jobs:
+  dora:
+    name: DORA per application
+    runs-on: ubuntu-latest
+
+    # Guard so the scheduled run only executes when the ref name matches
+    # (manual runs always allowed).
+    if: github.event_name != 'schedule' || github.ref_name == 'HD-650-HDD-dora-with-jira-comment'
+
     strategy:
       matrix:
-        emailQueue: { APP: "email-queue-api" }
-        enquiry:    { APP: "enquiry-api" }
-        enquirer:   { APP: "enquirer-api" }
+        app: [email-queue-api, enquiry-api, enquirer-api]
+
+    env:
+      # === Azure DevOps (ADO) context ===
+      ADO_ORG:        ${{ vars.ADO_ORG }}          # e.g. your-org-shortname (not URL)
+      ADO_PROJECT:    ${{ vars.ADO_PROJECT }}      # e.g. Hedd Salamander
+      BRANCH:         refs/heads/${{ github.ref_name }}
+      DAYS:           ${{ vars.DAYS }}             # optional override, else script uses 90
+      # Build definition IDs (from ADO) — set these in repo/org Variables
+      PIPELINE_ID_EMAIL_QUEUE: ${{ vars.PIPELINE_ID_EMAIL_QUEUE }}
+      PIPELINE_ID_ENQUIRY:     ${{ vars.PIPELINE_ID_ENQUIRY }}
+      PIPELINE_ID_ENQUIRER:    ${{ vars.PIPELINE_ID_ENQUIRER }}
+
+      # === GitHub context for the Python and bash steps ===
+      GITHUB_REPO: ${{ github.repository }}        # owner/repo
+      # GITHUB_TOKEN is automatically provided to the job as a secret
+
+      # === Jira (for comments/labels) ===
+      JIRA_SITE:      ${{ vars.JIRA_SITE }}        # e.g. https://yourtenant.atlassian.net
+      JIRA_ENV:       ${{ vars.JIRA_ENV }}         # e.g. Production
+      JIRA_ENV_TYPE:  ${{ vars.JIRA_ENV_TYPE }}    # e.g. production
+      JIRA_FORCE_KEYS: ${{ vars.JIRA_FORCE_KEYS }} # optional (e.g. "HD-650 OPS-7")
 
     steps:
-    - bash: |
-        COL="$(System.CollectionUri)"
-        ORG="${COL#https://dev.azure.com/}"; ORG="${ORG%/}"
-        echo "##vso[task.setvariable variable=ORG]$ORG"
-      displayName: "Derive org short name"
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - task: UsePythonVersion@0
-      inputs: { versionSpec: '3.11' }
-      displayName: "Use Python 3.11"
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-    - script: |
-        python -m pip install --upgrade pip
-        pip install requests
-      displayName: "Install deps"
+      - name: Install deps (pip + jq)
+        shell: bash
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          pip install requests
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
 
-    - checkout: self
+      - name: Resolve DEF_ID from variables
+        id: resolve
+        shell: bash
+        env:
+          APP: ${{ matrix.app }}
+          PID_EMAIL:    ${{ env.PIPELINE_ID_EMAIL_QUEUE }}
+          PID_ENQUIRY:  ${{ env.PIPELINE_ID_ENQUIRY }}
+          PID_ENQUIRER: ${{ env.PIPELINE_ID_ENQUIRER }}
+        run: |
+          set -e
+          case "$APP" in
+            email-queue-api) DID="$PID_EMAIL" ;;
+            enquiry-api)     DID="$PID_ENQUIRY" ;;
+            enquirer-api)    DID="$PID_ENQUIRER" ;;
+            *) echo "Unknown APP=$APP"; exit 1 ;;
+          esac
+          if [ -z "$DID" ]; then
+            echo "Missing pipeline ID for $APP. Set the appropriate repo variable."
+            exit 1
+          fi
+          echo "defId=$DID"
+          echo "DEF_ID=$DID" >> "$GITHUB_ENV"
 
-    - bash: |
-        case "$(APP)" in
-          email-queue-api) DID="$(PIPELINE_ID_EMAIL_QUEUE)";;
-          enquiry-api)     DID="$(PIPELINE_ID_ENQUIRY)";;
-          enquirer-api)    DID="$(PIPELINE_ID_ENQUIRER)";;
-          *) echo "Unknown APP=$(APP)"; exit 1;;
-        esac
-        echo "Using DEF_ID=$DID for APP=$(APP)"
-        echo "##vso[task.setvariable variable=DEF_ID]$DID"
-      displayName: "Resolve DEF_ID from variable group"
+      - name: Check commit/branch has Jira key
+        shell: bash
+        env:
+          APP: ${{ matrix.app }}
+        run: |
+          set -e
+          bundle="${{ github.event.head_commit.message || '' }} ${{ github.ref_name }}"
+          if echo "$bundle" | grep -Eq '\b[A-Z][A-Z0-9]+-[0-9]+\b'; then
+            echo "Jira key found."
+          else
+            echo "WARNING: No Jira key in commit message or branch."
+            # exit 1  # uncomment to enforce
+          fi
 
-    - script: |
-        echo "Running DORA for $(APP) (defId=$(DEF_ID))"
-        python tools/dora_config.py \
-          --org $(ORG) \
-          --project $(System.TeamProject) \
-          --pipeline-ids "$(DEF_ID)" \
-          --branch "$(BRANCH)" \
-          --days $([ -n "$(DAYS)" ] && echo "$(DAYS)" || echo 90) \
-          $([ -n "$(GITHUB_TOKEN)" ] && echo --github-token "$(GITHUB_TOKEN)" || true) \
-          --github-repo "$(GITHUB_REPO)" \
-          --app "$(APP)" \
-          --out-prefix "$(APP)-" \
-          --verbose
-      env:
-        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-        GITHUB_TOKEN: $(GITHUB_TOKEN)
-      displayName: "Compute DORA ($(APP))"
+      - name: Preflight: verify Jira token
+        if: ${{ env.JIRA_SITE && secrets.JIRA_USER && secrets.JIRA_TOKEN }}
+        shell: bash
+        env:
+          JIRA_SITE:  ${{ env.JIRA_SITE }}
+          JIRA_USER:  ${{ secrets.JIRA_USER }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Testing Jira /myself at $JIRA_SITE ..."
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            -u "$JIRA_USER:$JIRA_TOKEN" \
+            -H "Accept: application/json" \
+            "$JIRA_SITE/rest/api/3/myself")
+          echo "Jira /myself -> HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "❌ Jira credentials or site wrong. Fix JIRA_SITE/JIRA_USER/JIRA_TOKEN."
+            exit 1
+          fi
 
-    - bash: |
-        mkdir -p "$(Build.ArtifactStagingDirectory)/dora-$(APP)"
-        mv *.csv "$(Build.ArtifactStagingDirectory)/dora-$(APP)/" || true
-      displayName: "Stage CSVs ($(APP))"
+      - name: Compute DORA (${{ matrix.app }})
+        shell: bash
+        env:
+          AZDO_PAT:       ${{ secrets.AZDO_PAT }}       # required to query ADO REST
+          GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}   # built-in; ok for GH API usage within this repo
+        run: |
+          set -e
+          echo "Running DORA for ${{ matrix.app }} (defId=$DEF_ID)"
+          python tools/dora_config.py \
+            --org "$ADO_ORG" \
+            --project "$ADO_PROJECT" \
+            --pipeline-ids "$DEF_ID" \
+            --pat "$AZDO_PAT" \
+            --branch "$BRANCH" \
+            --days "${DAYS:-90}" \
+            --github-repo "$GITHUB_REPO" \
+            --app "${{ matrix.app }}" \
+            --out-prefix "${{ matrix.app }}-" \
+            --verbose
 
-    - task: PublishBuildArtifacts@1
-      inputs:
-        pathToPublish: '$(Build.ArtifactStagingDirectory)/dora-$(APP)'
-        artifactName: 'dora-$(APP)'
-      displayName: "Publish DORA CSVs ($(APP))"
+      - name: Publish GitHub Deployment (optional)
+        if: ${{ env.GITHUB_REPO && secrets.GITHUB_TOKEN }}
+        shell: bash
+        env:
+          APP:          ${{ matrix.app }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO:  ${{ env.GITHUB_REPO }}
+          JIRA_ENV:     ${{ env.JIRA_ENV }}
+        run: |
+          set -euo pipefail
+          FILE="${APP}-lead_time_for_changes.csv"
+          if [ ! -s "$FILE" ]; then
+            echo "No lead_time_for_changes CSV for ${APP}; skipping GitHub Deployment."
+            exit 0
+          fi
+          LAST_ROW="$(awk -F',' '
+            NR==1 { for(i=1;i<=NF;i++) idx[$i]=i; next }
+            { t=$idx["deployTimeUtc"]; if (t > max) { max=t; row=$0 } }
+            END { print row }
+          ' "$FILE")"
+          [ -z "$LAST_ROW" ] && { echo "No valid rows; skipping."; exit 0; }
+
+          IFS=',' read -r _app _buildId RUN_URL COMMIT _ct DEPLOY_TIME _s _h _hh <<< "$LAST_ROW"
+          OWNER_REPO="${GITHUB_REPO}"
+          ENV_LABEL="${JIRA_ENV:-production}"
+          if [ -z "${OWNER_REPO}" ] || [ -z "${COMMIT}" ]; then
+            echo "Missing OWNER_REPO or COMMIT; skipping."
+            exit 0
+          fi
+
+          echo "Creating GitHub deployment for $OWNER_REPO@$COMMIT to environment '$ENV_LABEL'"
+          CREATE_JSON=$(jq -n --arg ref "$COMMIT" --arg env "$ENV_LABEL" \
+                         '{ref:$ref, environment:$env, auto_merge:false, required_contexts:[]}')
+          CREATE_RESP=$(curl -sS -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER_REPO/deployments" \
+            -d "$CREATE_JSON")
+          DEPLOY_ID=$(echo "$CREATE_RESP" | jq -r '.id // empty')
+          if [ -z "$DEPLOY_ID" ]; then
+            echo "Failed to create GitHub deployment:"
+            echo "$CREATE_RESP"
+            exit 0
+          fi
+          echo "Deployment id: $DEPLOY_ID"
+
+          STATUS_JSON=$(jq -n --arg state "success" --arg env "$ENV_LABEL" \
+                             --arg log_url "$RUN_URL" \
+                             --arg desc "Azure slot swap to $ENV_LABEL at $DEPLOY_TIME" \
+                             '{state:$state, environment:$env, log_url:$log_url, description:$desc}')
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER_REPO/deployments/$DEPLOY_ID/statuses" \
+            -d "$STATUS_JSON" >/dev/null
+          echo "Deployment status posted."
+
+      - name: Annotate Jira issues with deployment info (ADF + label)
+        if: ${{ env.JIRA_SITE && secrets.JIRA_USER && secrets.JIRA_TOKEN }}
+        shell: bash
+        env:
+          APP:          ${{ matrix.app }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO:  ${{ env.GITHUB_REPO }}
+          JIRA_SITE:    ${{ env.JIRA_SITE }}
+          JIRA_USER:    ${{ secrets.JIRA_USER }}
+          JIRA_TOKEN:   ${{ secrets.JIRA_TOKEN }}
+          JIRA_ENV:     ${{ env.JIRA_ENV }}
+          JIRA_FORCE_KEYS: ${{ env.JIRA_FORCE_KEYS }}
+        run: |
+          set -euo pipefail
+          FILE="${APP}-lead_time_for_changes.csv"
+          if [ ! -s "$FILE" ]; then
+            echo "No CSV; skipping issue annotations."
+            exit 0
+          fi
+
+          LAST_ROW="$(awk -F',' '
+            NR==1 { for(i=1;i<=NF;i++) idx[$i]=i; next }
+            { t=$idx["deployTimeUtc"]; if (t > max) { max=t; row=$0 } }
+            END { print row }
+          ' "$FILE")"
+          [ -z "$LAST_ROW" ] && { echo "No valid rows"; exit 0; }
+
+          IFS=',' read -r _app _buildId RUN_URL COMMIT _ct DEPLOY_TIME _s _h _hh <<< "$LAST_ROW"
+          echo "Latest deploy -> COMMIT=$COMMIT RUN_URL=$RUN_URL DEPLOY_TIME=$DEPLOY_TIME"
+
+          OWNER_REPO="${GITHUB_REPO}"
+          if [ -z "$OWNER_REPO" ] || [ -z "$COMMIT" ]; then
+            echo "Missing GITHUB_REPO or commit sha; skipping."
+            exit 0
+          fi
+
+          COMMIT_MSG="$(curl -sS \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER_REPO/commits/$COMMIT" \
+            | jq -r '.commit.message // ""')"
+
+          PRS_JSON="$(curl -sS \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER_REPO/commits/$COMMIT/pulls")"
+          PR_TITLES="$(echo "$PRS_JSON" | jq -r '.[].title // empty')"
+          PR_BODIES="$(echo "$PRS_JSON" | jq -r '.[].body // empty')"
+          PR_BRANCHES="$(echo "$PRS_JSON" | jq -r '.[].head.ref // empty')"
+
+          ADO_BRANCH="${{ github.ref_name }}"
+          TEXT="$COMMIT_MSG
+          $PR_TITLES
+          $PR_BODIES
+          $PR_BRANCHES
+          $ADO_BRANCH"
+
+          if [ -n "${JIRA_FORCE_KEYS:-}" ]; then
+            echo "Using forced keys: $JIRA_FORCE_KEYS"
+            TEXT="$TEXT
+            $JIRA_FORCE_KEYS"
+          fi
+
+          KEYS="$(printf '%s\n' "$TEXT" | grep -Eo '\b[A-Z][A-Z0-9]+-[0-9]+\b' | sort -u)"
+          echo "Extracted keys:"
+          printf '  %s\n' $KEYS || true
+
+          if [ -z "$KEYS" ]; then
+            echo "No Jira keys found in commit/PR/branch. Nothing to annotate."
+            exit 0
+          fi
+
+          ENV_LABEL="${JIRA_ENV:-production}"
+          LABEL="deployed-$(echo "$ENV_LABEL" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
+
+          for K in $KEYS; do
+            echo "--- Annotating $K ---"
+            ADF=$(jq -n \
+              --arg app "$APP" \
+              --arg env "$ENV_LABEL" \
+              --arg when "$DEPLOY_TIME" \
+              --arg url "$RUN_URL" \
+              --arg sha "$COMMIT" \
+              '{
+                body: {
+                  type: "doc",
+                  version: 1,
+                  content: [
+                    { type: "paragraph",
+                      content: [{ type:"text", text: ("✅ Deployed " + $app + " to " + $env + " at " + $when) }]
+                    },
+                    { type: "paragraph",
+                      content: [
+                        { type:"text", text:"Run: "},
+                        { type:"text", text:$url, marks:[{type:"link", attrs:{href:$url}}]}
+                      ]
+                    },
+                    { type: "paragraph",
+                      content: [{ type:"text", text:("Commit: " + $sha)}]
+                    }
+                  ]
+                }
+              }')
+
+            echo "POST comment -> $JIRA_SITE/rest/api/3/issue/$K/comment"
+            curl -sS -w "\nHTTP %{http_code}\n" \
+              -u "$JIRA_USER:$JIRA_TOKEN" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              --data "$ADF" \
+              "$JIRA_SITE/rest/api/3/issue/$K/comment"
+
+            LABEL_PAYLOAD=$(jq -n --arg l "$LABEL" '{ update: { labels: [ { add: $l } ] } }')
+            echo "PUT labels -> $JIRA_SITE/rest/api/3/issue/$K"
+            curl -sS -w "\nHTTP %{http_code}\n" \
+              -u "$JIRA_USER:$JIRA_TOKEN" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              --data "$LABEL_PAYLOAD" \
+              "$JIRA_SITE/rest/api/3/issue/$K" || true
+
+            echo "Annotated $K"
+          done
+
+          echo "✅ Jira annotations complete."
+
+      - name: Upload DORA CSVs (${{ matrix.app }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: dora-${{ matrix.app }}
+          path: |
+            ${{ matrix.app }}-deployment_frequency.csv
+            ${{ matrix.app }}-lead_time_for_changes.csv
+            ${{ matrix.app }}-change_failure_rate.csv
+            ${{ matrix.app }}-failed_deployment_recovery_time.csv
+          if-no-files-found: warn
